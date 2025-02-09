@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Platformer Game – Scaled Full Screen with Stomp</title>
+  <style>
+    /* CSS reset and full-screen canvas styling */
+    html, body {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #000;
+      height: 100%;
+      width: 100%;
+    }
+    canvas {
+      display: block;
+      background: #000;
+    }
+  </style>
+  <!-- Include Socket.IO client library -->
+  <script src="https://cdn.socket.io/4.6.1/socket.io.min.js"></script>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <script>
+    // --- Helper Functions ---
+    function lerp(a, b, t) {
+      return a + (b - a) * t;
+    }
+
+    // Simple rectangle intersection test.
+    function rectIntersect(a, b) {
+      return (a.x < b.x + b.width &&
+              a.x + a.width > b.x &&
+              a.y < b.y + b.height &&
+              a.y + a.height > b.y);
+    }
+
+    // Helper to draw rounded rectangles.
+    function roundRect(ctx, x, y, width, height, radius, fill, stroke) {
+      if (typeof stroke === 'undefined') { stroke = true; }
+      if (typeof radius === 'undefined') { radius = 5; }
+      ctx.beginPath();
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + width - radius, y);
+      ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+      ctx.lineTo(x + width, y + height - radius);
+      ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+      ctx.lineTo(x + radius, y + height);
+      ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+      ctx.closePath();
+      if (fill) { ctx.fill(); }
+      if (stroke) { ctx.stroke(); }
+    }
+
+    // --- SOCKET MANAGER ---
+    class SocketManager {
+      constructor(multiplayerMode) {
+        this.multiplayerMode = multiplayerMode;
+        this.remotePlayers = {}; // { id: { currentX, currentY, targetX, targetY, username, score } }
+        this.localPlayerId = null;
+        this.leaderboard = [];
+        this.advanceLevelCallback = null;
+        if (this.multiplayerMode) {
+          this._initSocket();
+        } else {
+          this._createDummySocket();
+        }
+      }
+      
+      _initSocket() {
+        this.socket = io("https://game-server-production-f1e6.up.railway.app", {
+          transports: ["websocket"],
+          reconnection: true,
+          reconnectionAttempts: Infinity,
+          reconnectionDelay: 1000,
+          pingInterval: 30000,
+          pingTimeout: 90000
+        });
+        
+        this.socket.on("connect", () => {
+          console.log("Connected to game server.");
+        });
+        
+        this.socket.on("disconnect", () => {
+          console.log("Disconnected from game server.");
+        });
+        
+        this.socket.on("your_id", (data) => {
+          this.localPlayerId = data;
+          console.log("Received local player id:", this.localPlayerId);
+        });
+        
+        this.socket.on("player_update", (data) => {
+          // Data: { id: { x, y, username, score } }
+          for (let pid in data) {
+            if (pid === this.localPlayerId) continue;
+            const pdata = data[pid];
+            if (!this.remotePlayers[pid]) {
+              this.remotePlayers[pid] = {
+                currentX: pdata.x,
+                currentY: pdata.y,
+                targetX: pdata.x,
+                targetY: pdata.y,
+                username: pdata.username,
+                score: pdata.score
+              };
+            } else {
+              this.remotePlayers[pid].targetX = pdata.x;
+              this.remotePlayers[pid].targetY = pdata.y;
+              this.remotePlayers[pid].username = pdata.username;
+              this.remotePlayers[pid].score = pdata.score;
+            }
+          }
+          // Remove any players not in this update.
+          for (let pid in this.remotePlayers) {
+            if (!(pid in data)) {
+              delete this.remotePlayers[pid];
+            }
+          }
+        });
+        
+        this.socket.on("advance_level", (data) => {
+          console.log("Received advance_level event from server.");
+          if (this.advanceLevelCallback) { this.advanceLevelCallback(); }
+        });
+        
+        this.socket.on("leaderboard_update", (data) => {
+          this.leaderboard = data;
+          console.log("Received leaderboard update:", data);
+        });
+      }
+      
+      _createDummySocket() {
+        this.socket = {
+          emit: function(event, data) {},
+          disconnect: function() {}
+        };
+        this.remotePlayers = {};
+      }
+      
+      emitUpdate(data) {
+        if (this.socket && this.socket.connected) {
+          this.socket.emit("player_update", data);
+        }
+      }
+      
+      disconnect() {
+        if (this.socket && this.socket.disconnect) {
+          this.socket.disconnect();
+        }
+      }
+    }
+
+    // --- PLAYER CLASS ---
+    class Player {
+      constructor(x, y, width = 50, height = 50, color = "blue") {
+        this.x = x;
+        this.y = y;
+        this.width = width;
+        this.height = height;
+        this.color = color;
+        this.velocityX = 0;
+        this.velocityY = 0;
+        this.onGround = false;
+        this.speed = 5;
+        this.jumpStrength = -15;
+        this.gravity = 1;
+        this.terminalVelocity = 10;
+      }
+      
+      // Use keys (from global input) to update velocities.
+      handleInput(keys) {
+        this.velocityX = 0;
+        if (keys["ArrowLeft"]) {
+          this.velocityX = -this.speed;
+        }
+        if (keys["ArrowRight"]) {
+          this.velocityX = this.speed;
+        }
+        if ((keys[" "] || keys["Space"]) && this.onGround) {
+          this.velocityY = this.jumpStrength;
+          this.onGround = false;
+        }
+      }
+      
+      update(platforms) {
+        // Apply gravity.
+        this.velocityY += this.gravity;
+        if (this.velocityY > this.terminalVelocity) { this.velocityY = this.terminalVelocity; }
+        
+        // Horizontal movement and collision with platforms.
+        this.x += this.velocityX;
+        for (let plat of platforms) {
+          if (rectIntersect(this, plat)) {
+            if (this.velocityX > 0) {
+              this.x = plat.x - this.width;
+            } else if (this.velocityX < 0) {
+              this.x = plat.x + plat.width;
+            }
+            this.velocityX = 0;
+          }
+        }
+        
+        // Vertical movement and collision with platforms.
+        this.y += this.velocityY;
+        this.onGround = false;
+        for (let plat of platforms) {
+          if (rectIntersect(this, plat)) {
+            if (this.velocityY > 0) {
+              this.y = plat.y - this.height;
+              this.velocityY = 0;
+              this.onGround = true;
+            } else if (this.velocityY < 0) {
+              this.y = plat.y + plat.height;
+              this.velocityY = 0;
+            }
+          }
+        }
+      }
+      
+      draw(ctx) {
+        ctx.fillStyle = this.color;
+        ctx.fillRect(this.x, this.y, this.width, this.height);
+      }
+    }
+
+    // --- PORTAL CLASS ---
+    class Portal {
+      constructor(x, y, radius = 30) {
+        this.x = x;
+        this.y = y;
+        this.radius = radius;
+        this.angle = 0;
+      }
+      
+      update() {
+        this.angle = (this.angle + 5) % 360;
+      }
+      
+      draw(ctx, time) {
+        let pulse = this.radius + 5 * Math.sin(time * 0.005);
+        ctx.fillStyle = "rgb(50,50,50)";
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, pulse + 5, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.fillStyle = "black";
+        ctx.beginPath();
+        ctx.arc(this.x, this.y, pulse, 0, Math.PI * 2);
+        ctx.fill();
+        
+        let rad = pulse;
+        let endX = this.x + rad * Math.cos(this.angle * Math.PI / 180);
+        let endY = this.y + rad * Math.sin(this.angle * Math.PI / 180);
+        ctx.strokeStyle = "white";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(this.x, this.y);
+        ctx.lineTo(endX, endY);
+        ctx.stroke();
+      }
+      
+      getRect() {
+        return { x: this.x - this.radius, y: this.y - this.radius, width: this.radius * 2, height: this.radius * 2 };
+      }
+    }
+
+    // --- GAME CLASS ---
+    class Game {
+      constructor(multiplayerMode, canvas, ctx) {
+        // Our fixed base game resolution (as in the Python version):
+        this.baseWidth = 800;
+        this.baseHeight = 600;
+        this.WIDTH = this.baseWidth;
+        this.HEIGHT = this.baseHeight;
+        this.canvas = canvas;
+        this.ctx = ctx;
+        this.multiplayerMode = multiplayerMode;
+        this.socketManager = new SocketManager(multiplayerMode);
+        if (this.multiplayerMode) {
+          this.socketManager.advanceLevelCallback = () => this.advanceLevelSync();
+        }
+        this.lastUpdateTime = performance.now();
+        this.updateInterval = 50; // milliseconds
+        this.player = new Player(50, this.HEIGHT - 100);
+        
+        // Define levels (positions in base coordinates).
+        this.levels = {
+          1: {
+            start: { x: 50, y: this.HEIGHT - 100 },
+            platforms: [
+              { x: 0, y: this.HEIGHT - 50, width: this.WIDTH, height: 50 },
+              { x: 150, y: 450, width: 150, height: 20 },
+              { x: 350, y: 350, width: 150, height: 20 },
+              { x: 550, y: 250, width: 150, height: 20 }
+            ],
+            portal: new Portal(700, this.HEIGHT - 100, 30)
+          },
+          2: {
+            start: { x: 50, y: this.HEIGHT - 100 },
+            platforms: [
+              { x: 0, y: this.HEIGHT - 50, width: this.WIDTH, height: 50 },
+              { x: 100, y: 400, width: 150, height: 20 },
+              { x: 300, y: 300, width: 150, height: 20 },
+              { x: 500, y: 200, width: 150, height: 20 }
+            ],
+            portal: null
+          }
+        };
+        this.currentLevel = 1;
+        this.platforms = this.levels[this.currentLevel].platforms;
+        this.portal = this.levels[this.currentLevel].portal;
+        this.running = true;
+        this.score = 1;
+        
+        // UI flags and settings (in base coordinates).
+        this.showLeaderboard = false;
+        this.showSettings = false;
+        this.username = "Player";
+        this.usernameInput = this.username;
+        this.settingsButtonRect = { x: 10, y: 10, width: 100, height: 40 };
+        this.leaderboardButtonRect = { x: this.WIDTH - 110, y: 10, width: 100, height: 40 };
+      }
+      
+      resetPlayer() {
+        const start = this.levels[this.currentLevel].start;
+        this.player.x = start.x;
+        this.player.y = start.y;
+        this.player.velocityX = 0;
+        this.player.velocityY = 0;
+      }
+      
+      _advanceLevelLocal() {
+        if (this.currentLevel < Object.keys(this.levels).length) {
+          this.currentLevel++;
+          const start = this.levels[this.currentLevel].start;
+          this.player.x = start.x;
+          this.player.y = start.y;
+          this.platforms = this.levels[this.currentLevel].platforms;
+          this.portal = this.levels[this.currentLevel].portal;
+          this.score = this.currentLevel;
+          console.log(`Advanced to level ${this.currentLevel}!`);
+        } else {
+          console.log("You completed all levels!");
+          this.running = false;
+        }
+      }
+      
+      advanceLevelSync() {
+        this._advanceLevelLocal();
+      }
+      
+      update(deltaTime, currentTime) {
+        if (!this.showSettings) {
+          this.player.handleInput(keys);
+          this.player.update(this.platforms);
+          
+          // Out-of-bounds check.
+          if (this.player.y > this.HEIGHT ||
+              this.player.x > this.WIDTH ||
+              (this.player.x + this.player.width) < 0) {
+            console.log("Out of bounds! Resetting player.");
+            this.resetPlayer();
+          }
+          
+          // Portal collision.
+          if (this.portal && rectIntersect(this.player, this.portal.getRect())) {
+            console.log("Portal reached!");
+            if (this.multiplayerMode) {
+              this.socketManager.socket.emit("advance_level", {});
+            }
+            this._advanceLevelLocal();
+          }
+          
+          if (this.portal) {
+            this.portal.update();
+          }
+          
+          // --- NEW: Check collision with remote (Python) players ---
+          if (this.multiplayerMode) {
+            for (let pid in this.socketManager.remotePlayers) {
+              let rp = this.socketManager.remotePlayers[pid];
+              // Assume remote players are drawn as 50x50 rectangles.
+              let remoteRect = { x: rp.currentX, y: rp.currentY, width: 50, height: 50 };
+              if (rectIntersect(this.player, remoteRect)) {
+                // Check if collision is from above (i.e. local player is falling onto the remote player's top).
+                if (this.player.velocityY > 0 && ((this.player.y + this.player.height) - remoteRect.y) < 15) {
+                  console.log("Stomped remote player:", pid);
+                  // Bounce the local player upward (simulate a jump).
+                  this.player.velocityY = this.player.jumpStrength * 0.75;
+                }
+              }
+            }
+          }
+        }
+        
+        // Send multiplayer update (throttled).
+        if (this.multiplayerMode && currentTime - this.lastUpdateTime > this.updateInterval) {
+          this.socketManager.emitUpdate({
+            x: this.player.x,
+            y: this.player.y,
+            username: this.username,
+            score: this.score
+          });
+          this.lastUpdateTime = currentTime;
+        }
+        
+        // Interpolate remote player positions.
+        if (this.multiplayerMode) {
+          for (let pid in this.socketManager.remotePlayers) {
+            let pdata = this.socketManager.remotePlayers[pid];
+            pdata.currentX = lerp(pdata.currentX, pdata.targetX, 0.1);
+            pdata.currentY = lerp(pdata.currentY, pdata.targetY, 0.1);
+          }
+        }
+      }
+      
+      draw(currentTime) {
+        // --- Compute scaling transformation ---
+        const baseWidth = this.baseWidth;
+        const baseHeight = this.baseHeight;
+        const scale = Math.min(this.canvas.width / baseWidth, this.canvas.height / baseHeight);
+        const offsetX = (this.canvas.width - baseWidth * scale) / 2;
+        const offsetY = (this.canvas.height - baseHeight * scale) / 2;
+        
+        // Clear entire canvas.
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        // Apply transformation so our game (in base coordinates) is scaled and centered.
+        this.ctx.save();
+        this.ctx.translate(offsetX, offsetY);
+        this.ctx.scale(scale, scale);
+        
+        // Draw background.
+        this.ctx.fillStyle = "black";
+        this.ctx.fillRect(0, 0, baseWidth, baseHeight);
+        
+        // --- Draw platforms ---
+        this.ctx.fillStyle = "white";
+        for (let plat of this.platforms) {
+          this.ctx.fillRect(plat.x, plat.y, plat.width, plat.height);
+        }
+        
+        // --- Draw local player ---
+        this.player.draw(this.ctx);
+        
+        // --- Draw portal ---
+        if (this.portal) {
+          this.portal.draw(this.ctx, currentTime);
+        }
+        
+        // --- Draw remote players ---
+        if (this.multiplayerMode) {
+          this.ctx.fillStyle = "red";
+          for (let pid in this.socketManager.remotePlayers) {
+            let pdata = this.socketManager.remotePlayers[pid];
+            this.ctx.fillRect(pdata.currentX, pdata.currentY, 50, 50);
+          }
+          // Show connection status.
+          let statusText = (this.socketManager.socket && this.socketManager.socket.connected)
+            ? "Connected" : "Disconnected";
+          this.ctx.fillStyle = (statusText === "Connected") ? "green" : "red";
+          this.ctx.font = "16px Arial";
+          this.ctx.fillText("Status: " + statusText, 10, 70);
+        }
+        
+        // --- Draw level indicator ---
+        this.ctx.fillStyle = "white";
+        this.ctx.fillText("Level: " + this.currentLevel, this.WIDTH - 120, 70);
+        
+        // --- Draw UI Buttons (in base coordinates) ---
+        // Settings button.
+        this.ctx.fillStyle = "gray";
+        this.ctx.fillRect(this.settingsButtonRect.x, this.settingsButtonRect.y, this.settingsButtonRect.width, this.settingsButtonRect.height);
+        this.ctx.fillStyle = "white";
+        this.ctx.font = "16px Arial";
+        this.ctx.fillText("Settings", this.settingsButtonRect.x + 5, this.settingsButtonRect.y + 25);
+        this.ctx.fillText(this.username, this.settingsButtonRect.x + this.settingsButtonRect.width + 10, this.settingsButtonRect.y + 25);
+        
+        // Leaderboard button.
+        this.ctx.fillStyle = "gray";
+        this.ctx.fillRect(this.leaderboardButtonRect.x, this.leaderboardButtonRect.y, this.leaderboardButtonRect.width, this.leaderboardButtonRect.height);
+        this.ctx.fillStyle = "white";
+        this.ctx.fillText("Leaderboard", this.leaderboardButtonRect.x + 5, this.leaderboardButtonRect.y + 25);
+        
+        // --- Draw Leaderboard overlay if toggled ---
+        if (this.showLeaderboard) {
+          this.ctx.fillStyle = "rgba(50,50,50,0.9)";
+          let overlayWidth = baseWidth * 0.8;
+          let overlayHeight = baseHeight * 0.8;
+          let overlayX = (baseWidth - overlayWidth) / 2;
+          let overlayY = (baseHeight - overlayHeight) / 2;
+          this.ctx.fillRect(overlayX, overlayY, overlayWidth, overlayHeight);
+          this.ctx.fillStyle = "white";
+          this.ctx.font = "24px Arial";
+          this.ctx.fillText("Leaderboard", overlayX + 20, overlayY + 40);
+          this.ctx.font = "20px Arial";
+          if (this.socketManager.leaderboard) {
+            for (let i = 0; i < this.socketManager.leaderboard.length; i++) {
+              let entry = this.socketManager.leaderboard[i];
+              let name = entry.username || entry.id || "Unknown";
+              let score = entry.score || 0;
+              this.ctx.fillText(`${i+1}. ${name}: ${score}`, overlayX + 20, overlayY + 80 + i * 30);
+            }
+          }
+        }
+        
+        // --- Draw Settings overlay if active ---
+        if (this.showSettings) {
+          this.ctx.fillStyle = "rgba(50,50,50,0.9)";
+          let overlayWidth = baseWidth * 0.5;
+          let overlayHeight = baseHeight * 0.3;
+          let overlayX = (baseWidth - overlayWidth) / 2;
+          let overlayY = (baseHeight - overlayHeight) / 2;
+          this.ctx.fillRect(overlayX, overlayY, overlayWidth, overlayHeight);
+          this.ctx.fillStyle = "white";
+          this.ctx.font = "24px Arial";
+          this.ctx.fillText("Enter username:", overlayX + 20, overlayY + 40);
+          // Draw input box.
+          this.ctx.fillStyle = "gray";
+          this.ctx.fillRect(overlayX + 20, overlayY + 60, overlayWidth - 40, 40);
+          this.ctx.fillStyle = "white";
+          this.ctx.font = "20px Arial";
+          this.ctx.fillText(this.usernameInput, overlayX + 25, overlayY + 85);
+          this.ctx.font = "16px Arial";
+          this.ctx.fillText("Press Enter to confirm", overlayX + 20, overlayY + overlayHeight - 20);
+        }
+        
+        this.ctx.restore();
+      }
+      
+      run() {
+        let lastTime = performance.now();
+        const loop = (currentTime) => {
+          if (!this.running) {
+            if (this.multiplayerMode) { this.socketManager.disconnect(); }
+            return;
+          }
+          let deltaTime = currentTime - lastTime;
+          lastTime = currentTime;
+          this.update(deltaTime, currentTime);
+          this.draw(currentTime);
+          requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+      }
+    }
+
+    // --- Global Input Handling ---
+    let keys = {};  // Track key states.
+    let gameInstance = null;
+
+    window.addEventListener("keydown", (e) => {
+      if (gameInstance && gameInstance.showSettings) {
+        if (e.key === "Enter") {
+          gameInstance.username = gameInstance.usernameInput;
+          gameInstance.showSettings = false;
+        } else if (e.key === "Backspace") {
+          gameInstance.usernameInput = gameInstance.usernameInput.slice(0, -1);
+        } else if (e.key.length === 1) {
+          gameInstance.usernameInput += e.key;
+        }
+      } else {
+        keys[e.key] = true;
+      }
+    });
+    window.addEventListener("keyup", (e) => { keys[e.key] = false; });
+
+    // --- Mouse click handling for UI buttons ---
+    const canvas = document.getElementById("gameCanvas");
+    canvas.addEventListener("mousedown", (e) => {
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+      // Convert from canvas (screen) coordinates to base game coordinates.
+      const baseWidth = 800, baseHeight = 600;
+      const scale = Math.min(canvas.width / baseWidth, canvas.height / baseHeight);
+      const offsetX = (canvas.width - baseWidth * scale) / 2;
+      const offsetY = (canvas.height - baseHeight * scale) / 2;
+      const baseX = (mouseX - offsetX) / scale;
+      const baseY = (mouseY - offsetY) / scale;
+      
+      if (!gameInstance.showSettings) {
+        // Check Settings button.
+        const s = gameInstance.settingsButtonRect;
+        if (baseX >= s.x && baseX <= s.x + s.width &&
+            baseY >= s.y && baseY <= s.y + s.height) {
+          gameInstance.showSettings = true;
+          gameInstance.usernameInput = gameInstance.username;
+          return;
+        }
+        // Check Leaderboard button.
+        const lb = gameInstance.leaderboardButtonRect;
+        if (baseX >= lb.x && baseX <= lb.x + lb.width &&
+            baseY >= lb.y && baseY <= lb.y + lb.height) {
+          gameInstance.showLeaderboard = !gameInstance.showLeaderboard;
+          return;
+        }
+      }
+    });
+
+    // --- MENU SCREEN ---
+    // A simple menu drawn directly on the canvas.
+    function menuScreen(canvas, ctx) {
+      return new Promise(resolve => {
+        let selecting = true;
+        const fontTitle = "64px Arial";
+        const fontOption = "32px Arial";
+        const spButton = { x: canvas.width / 2 - 220, y: 300, width: 200, height: 80 };
+        const mpButton = { x: canvas.width / 2 + 20, y: 300, width: 200, height: 80 };
+        
+        function drawMenu() {
+          ctx.fillStyle = "rgb(20,20,20)";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          // Decorative circles.
+          for (let i = 0; i < 50; i++) {
+            let x = (i * 17) % canvas.width;
+            let y = (i * 23) % canvas.height;
+            ctx.fillStyle = "rgb(100,100,100)";
+            ctx.beginPath();
+            ctx.arc(x, y, 2, 0, Math.PI * 2);
+            ctx.fill();
+          }
+          // Title.
+          ctx.font = fontTitle;
+          const titleText = "Platformer";
+          const titleWidth = ctx.measureText(titleText).width;
+          ctx.fillStyle = "black";
+          ctx.fillText(titleText, canvas.width / 2 - titleWidth / 2 + 4, 100 + 4);
+          ctx.fillStyle = "white";
+          ctx.fillText(titleText, canvas.width / 2 - titleWidth / 2, 100);
+          // Singleplayer button.
+          ctx.fillStyle = "rgb(0,150,200)";
+          roundRect(ctx, spButton.x, spButton.y, spButton.width, spButton.height, 10, true, false);
+          ctx.fillStyle = "black";
+          ctx.font = fontOption;
+          const spText = "Singleplayer";
+          const spTextWidth = ctx.measureText(spText).width;
+          ctx.fillText(spText, spButton.x + spButton.width / 2 - spTextWidth / 2, spButton.y + spButton.height / 2 + 10);
+          // Multiplayer button.
+          ctx.fillStyle = "rgb(200,150,0)";
+          roundRect(ctx, mpButton.x, mpButton.y, mpButton.width, mpButton.height, 10, true, false);
+          ctx.fillStyle = "black";
+          const mpText = "Multiplayer";
+          const mpTextWidth = ctx.measureText(mpText).width;
+          ctx.fillText(mpText, mpButton.x + mpButton.width / 2 - mpTextWidth / 2, mpButton.y + mpButton.height / 2 + 10);
+        }
+        
+        function onMouseDown(e) {
+          let rect = canvas.getBoundingClientRect();
+          let mouseX = e.clientX - rect.left;
+          let mouseY = e.clientY - rect.top;
+          if (mouseX >= spButton.x && mouseX <= spButton.x + spButton.width &&
+              mouseY >= spButton.y && mouseY <= spButton.y + spButton.height) {
+            selecting = false;
+            cleanup();
+            resolve(false); // Singleplayer.
+          } else if (mouseX >= mpButton.x && mouseX <= mpButton.x + mpButton.width &&
+                     mouseY >= mpButton.y && mouseY <= mpButton.y + mpButton.height) {
+            selecting = false;
+            cleanup();
+            resolve(true); // Multiplayer.
+          }
+        }
+        
+        function cleanup() {
+          canvas.removeEventListener("mousedown", onMouseDown);
+        }
+        
+        canvas.addEventListener("mousedown", onMouseDown);
+        
+        function loop() {
+          if (!selecting) return;
+          drawMenu();
+          requestAnimationFrame(loop);
+        }
+        loop();
+      });
+    }
+
+    // --- Set canvas to full screen and update on resize ---
+    function resizeCanvas(canvas) {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+    }
+
+    // --- MAIN ---
+    document.addEventListener("DOMContentLoaded", () => {
+      const canvas = document.getElementById("gameCanvas");
+      resizeCanvas(canvas);
+      const ctx = canvas.getContext("2d");
+      
+      window.addEventListener("resize", () => {
+        resizeCanvas(canvas);
+      });
+      
+      // Show the menu screen first.
+      menuScreen(canvas, ctx).then(multiplayerMode => {
+        gameInstance = new Game(multiplayerMode, canvas, ctx);
+        gameInstance.run();
+      });
+    });
+  </script>
+</body>
+</html>
+
